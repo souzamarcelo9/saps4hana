@@ -289,9 +289,10 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
 
       INTO CORRESPONDING FIELDS OF TABLE @lt_full_data.
 
-      " =====================================================================
+***************************************************************************
+ " ========================================================================
       " --- BLOCO 2: Writer (Nota Manual - LINHA ÚNICA C/ LOOKUP DE PROJETO) ---
-      " =====================================================================
+ " ========================================================================
 
       DATA lt_writer_raw TYPE STANDARD TABLE OF zi_billing_min_q.
 
@@ -345,7 +346,12 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
 
         " Placeholders
         CAST( ' ' AS CHAR( 80 ) )     AS CustomerName,
-        CAST( ' ' AS CHAR( 10 ) )     AS StatusNF,
+        "CAST( ' ' AS CHAR( 10 ) )     AS StatusNF,
+        case when  _BKPF~ReverseDocument is not initial
+           then 'Cancelado'
+           else 'Emitida'
+        end as StatusNF,
+
         CAST( ' ' AS CHAR( 24 ) )     AS IdProjeto,
         CAST( ' ' AS CHAR( 40 ) )     AS IdtProjeto,
         CAST( ' ' AS CHAR( 14 ) )     AS CNPJ,
@@ -516,9 +522,12 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
 
           IF lr_status_db IS NOT INITIAL.
               IF ls_row-StatusNF = 'Cancelado'.
-                 IF 'X' NOT IN lr_status_db. CONTINUE. ENDIF.
+                 IF 'X' NOT IN lr_status_db. CONTINUE.
+                 ENDIF.
               ELSE.
-                 IF ' ' NOT IN lr_status_db AND '' NOT IN lr_status_db. CONTINUE. ENDIF.
+                 IF ' ' NOT IN lr_status_db AND '' NOT IN lr_status_db.
+                  CONTINUE.
+                 ENDIF.
               ENDIF.
           ENDIF.
 
