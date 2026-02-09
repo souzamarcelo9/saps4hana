@@ -1,0 +1,565 @@
+CLASS zcl_rap_billing_min_q DEFINITION PUBLIC FINAL CREATE PUBLIC.
+  PUBLIC SECTION.
+    INTERFACES if_rap_query_provider.
+ENDCLASS.
+
+CLASS zcl_rap_billing_min_q IMPLEMENTATION.
+
+  METHOD if_rap_query_provider~select.
+
+    "== 0) Paging ===
+    DATA(lo_paging) = io_request->get_paging( ).
+    DATA lv_pagesize TYPE i VALUE 200.
+    DATA lv_offset   TYPE i VALUE 0.
+    DATA lv_customer(10) type c.
+
+    IF lo_paging IS BOUND.
+      lv_pagesize = lo_paging->get_page_size( ).
+      lv_offset   = lo_paging->get_offset( ).
+    ENDIF.
+    IF lv_pagesize <= 0. lv_pagesize = 200. ENDIF.
+    IF lv_offset < 0.    lv_offset = 0.     ENDIF.
+
+    "=== 1) Flags do request ===
+    DATA(l_wants_data)  = io_request->is_data_requested( ).
+    DATA(l_wants_count) = io_request->is_total_numb_of_rec_requested( ).
+
+    "=== 2) Filtros ===
+    DATA lt_filter_cond TYPE if_rap_query_filter=>tt_name_range_pairs.
+    TRY.
+        lt_filter_cond = io_request->get_filter( )->get_as_ranges( ).
+      CATCH cx_rap_query_filter_no_range.
+        CLEAR lt_filter_cond.
+    ENDTRY.
+
+    " -- Variáveis de Filtro --
+    DATA lv_date_from TYPE d.
+    DATA lv_date_to   TYPE d.
+    DATA lv_cust      TYPE zi_billing_min_q-CustomerId.
+
+    " 2.1) Data e Cliente (Já existentes)
+    DATA(lr_date) = VALUE #( lt_filter_cond[ name = 'DOCDATEOUT' ]-range OPTIONAL ).
+    IF lr_date IS NOT INITIAL.
+      IF lr_date[ 1 ]-low IS NOT INITIAL. lv_date_from = CONV d( lr_date[ 1 ]-low ). ENDIF.
+      IF lr_date[ 1 ]-high IS NOT INITIAL. lv_date_to   = CONV d( lr_date[ 1 ]-high ). ENDIF.
+    ENDIF.
+
+    DATA(lr_cust) = VALUE #( lt_filter_cond[ name = 'CUSTOMERID' ]-range OPTIONAL ).
+    IF lr_cust IS NOT INITIAL AND lr_cust[ 1 ]-low IS NOT INITIAL.
+      lv_cust = lr_cust[ 1 ]-low.
+    ENDIF.
+
+    " 2.2) Novos Filtros Simples (Range Direto)
+    DATA(lr_plant)   = VALUE #( lt_filter_cond[ name = 'PLANT' ]-range OPTIONAL ).
+    DATA(lr_project) = VALUE #( lt_filter_cond[ name = 'IDPROJETO' ]-range OPTIONAL ).
+    DATA(lr_nfse)    = VALUE #( lt_filter_cond[ name = 'NFEOUT' ]-range OPTIONAL ).
+    DATA(lr_gjahr)   = VALUE #( lt_filter_cond[ name = 'FISCALYEAR' ]-range OPTIONAL ).
+
+    " 2.3) Tratamento Status NF (Emitida='' vs Cancelado='X')
+    DATA(lr_status_ui) = VALUE #( lt_filter_cond[ name = 'STATUSNF' ]-range OPTIONAL ).
+
+    " === CORREÇÃO: Declaração Manual Explicita (Char 1) ===
+    TYPES: BEGIN OF ty_status_range,
+             sign   TYPE c LENGTH 1,
+             option TYPE c LENGTH 2,
+             low    TYPE c LENGTH 1,
+             high   TYPE c LENGTH 1,
+           END OF ty_status_range.
+
+    DATA lr_status_db TYPE STANDARD TABLE OF ty_status_range.
+    " ======================================================
+
+    IF lr_status_ui IS NOT INITIAL.
+      LOOP AT lr_status_ui INTO DATA(ls_st).
+        DATA ls_db LIKE LINE OF lr_status_db.
+
+        ls_db-sign   = 'I'.
+        ls_db-option = 'EQ'.
+
+        IF ls_st-low = 'Cancelado'.
+          ls_db-low = 'X'.
+          APPEND ls_db TO lr_status_db.
+        ELSEIF ls_st-low = 'Emitida'.
+          ls_db-low = ' '. " Espaço/Vazio
+          APPEND ls_db TO lr_status_db.
+
+          " Adiciona também o vazio nulo por garantia
+          ls_db-low = ''.
+          APPEND ls_db TO lr_status_db.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    " 2.4) Tratamento Status Pagto (Quitado vs Em Aberto)
+    " Como é calculado via Data de Compensação, usaremos flags booleanas para o WHERE
+    DATA(lr_pagto) = VALUE #( lt_filter_cond[ name = 'STATUSPAGTO' ]-range OPTIONAL ).
+    DATA: lv_check_paid TYPE abap_bool VALUE abap_false,
+          lv_check_open TYPE abap_bool VALUE abap_false.
+
+    IF lr_pagto IS INITIAL.
+      " Se não filtrou, traz tudo
+      lv_check_paid = abap_true.
+      lv_check_open = abap_true.
+    ELSE.
+      LOOP AT lr_pagto INTO DATA(ls_pg).
+        IF ls_pg-low = 'Quitado'.   lv_check_paid = abap_true. ENDIF.
+        IF ls_pg-low = 'Em aberto'. lv_check_open = abap_true. ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+    "=== 3) COUNT total ===
+    IF l_wants_count = abap_true.
+      DATA: lv_total_fat TYPE int8,
+            lv_total_wri TYPE int8.
+
+      " Count Faturamento
+      SELECT COUNT( * ) FROM I_BillingDocumentItem AS bi
+        INNER JOIN I_BillingDocument AS b ON bi~BillingDocument = b~BillingDocument
+        " LEFT JOIN necessário para filtrar projeto/pagto no count
+        LEFT JOIN ZI_BILLING_ACCT_DOC_AGG AS acc
+             ON acc~BillingDocument = bi~BillingDocument
+            AND acc~BillingDocumentItem = bi~BillingDocumentItem
+            AND acc~Ledger = '0L'
+        LEFT JOIN zi_billing_proj_comp AS viewproj
+             ON viewproj~BillingDocument = bi~BillingDocument
+            AND viewproj~BillingDocumentItem = bi~BillingDocumentItem
+        LEFT JOIN I_BR_NFItem AS _J1BNFLIN
+             ON  bi~BillingDocument     = _J1BNFLIN~BR_NFSourceDocumentNumber
+             AND bi~BillingDocumentItem = _J1BNFLIN~BR_NFSourceDocumentItem
+             AND _J1BNFLIN~BR_NFSourceDocumentType = 'BI'
+        LEFT JOIN I_BR_NFDocument AS nf
+             ON nf~BR_NotaFiscal = _J1BNFLIN~BR_NotaFiscal
+
+        WHERE ( @lv_date_from IS INITIAL OR b~BillingDocumentDate >= @lv_date_from )
+          AND ( @lv_date_to   IS INITIAL OR b~BillingDocumentDate <= @lv_date_to   )
+          AND ( @lv_cust      IS INITIAL OR b~SoldToParty          = @lv_cust )
+          " Novos Filtros
+          AND ( b~FiscalYear IN @lr_gjahr )
+          AND ( bi~Plant IN @lr_plant )             " Centro
+          AND ( viewproj~ProjectID IN @lr_project ) " Projeto
+          AND ( nf~BR_NFSNumber IN @lr_nfse )       " NFSe
+          AND ( b~BillingDocumentIsCancelled IN @lr_status_db ) " Status NF
+          " Lógica Pagamento (Quitado = Data Preenchida OR Em Aberto = Data Vazia)
+          AND ( ( @lv_check_paid = 'X' AND acc~ClearingDate IS NOT INITIAL ) OR
+                ( @lv_check_open = 'X' AND acc~ClearingDate IS INITIAL ) )
+        INTO @lv_total_fat.
+
+**********************************************************************
+      " Count Writer
+*===================================================================
+     SELECT COUNT( * ) FROM I_JournalEntry AS _BKPF
+
+       INNER JOIN I_JournalEntryItem AS _BSAD ON _BSAD~CompanyCode = _BKPF~CompanyCode
+                                             AND _BSAD~AccountingDocument = _BKPF~AccountingDocument
+                                             AND _BSAD~Ledger = '0L'
+                                             AND _BSAD~FiscalYear = _BKPF~FiscalYear
+
+       LEFT JOIN I_BR_NFDocument AS nfd
+          ON  nfd~CompanyCode       = _BKPF~CompanyCode           " 1. Mesma Empresa
+         AND nfd~BR_NFSNumber       = _BKPF~DocumentReferenceID   " 2. Mesmo Número (XBLNR)
+         AND nfd~BR_NFPostingDate   = _BKPF~PostingDate           " 3. Mesma Data
+         AND nfd~BusinessPlace      = _BSAD~Plant         " 4. Mesmo Local de Negócio (CRUCIAL)
+         AND nfd~BR_NFPartner       = _BSAD~Customer              " 5. Mesmo Cliente (CRUCIAL)
+
+       LEFT JOIN I_BR_NFItem AS nfi ON nfd~BR_NotaFiscal = nfi~BR_NotaFiscal
+
+       LEFT JOIN ZI_JOURNAL_PROJ_COMP AS viewproj ON viewproj~AccountingDocument = _BSAD~AccountingDocument
+                                                AND viewproj~AccountingDocumentItem = _BSAD~AccountingDocumentItem
+
+        WHERE
+
+          _BKPF~CompanyCode = 'BR01'
+          "AND _BKPF~Ledger = '0L'
+          AND ( _BKPF~FiscalYear in @lr_gjahr )
+          AND ( nfd~BR_NFIsCanceled IN @lr_status_db )
+          AND ( @lv_date_from IS INITIAL OR _BKPF~DocumentDate >= @lv_date_from )
+          AND ( @lv_date_to   IS INITIAL OR _BKPF~DocumentDate <= @lv_date_to   )
+          AND ( @lv_cust      IS INITIAL OR nfd~BR_NFPartner    = @lv_cust )
+          " Novos Filtros Writer
+          AND ( nfd~BusinessPlace IN @lr_plant )    " Centro (Writer usa BusinessPlace)
+          AND ( viewproj~ProjectID IN @lr_project ) " Projeto
+          AND ( nfd~BR_NFSNumber IN @lr_nfse )      " NFSe
+          " Nota: Writer filtrada aqui sempre assume 'Emitida' pois filtramos Canceled='' acima.
+          AND ( ( @lv_check_paid = 'X' AND _BSAD~ClearingDate IS NOT INITIAL ) OR ( @lv_check_open = 'X' AND _BSAD~ClearingDate IS INITIAL ) )
+          AND _BKPF~AccountingDocumentType = 'DR'
+          AND  _BSAD~Ledger = '0L'
+
+        INTO @lv_total_wri.
+
+      io_response->set_total_number_of_records( lv_total_fat + lv_total_wri ).
+    ENDIF.
+
+**********************************************************************
+    "=== 4) Dados ===*
+**********************************************************************
+    IF l_wants_data = abap_true.
+      DATA lt_page TYPE STANDARD TABLE OF zi_billing_min_q.
+      DATA lt_full_data TYPE STANDARD TABLE OF zi_billing_min_q.
+
+      " --- BLOCO 1: Faturamento ---
+      SELECT
+        b~BillingDocument AS DocNumberOut,
+        bi~BillingDocumentItem AS ItemNumber,
+        b~BillingDocumentDate AS DocDateOut,
+        b~SoldToParty AS CustomerId,
+        b~TransactionCurrency AS DocumentCurrency,
+        bp~BusinessPartnerFullName AS CustomerName,
+        bi~Plant as Plant,
+        b~FiscalYear as FiscalYear,
+        CASE b~BillingDocumentIsCancelled
+          WHEN 'X' THEN 'Cancelado'
+          ELSE 'Emitida'
+        END AS StatusNF,
+        b~TotalNetAmount + b~TotalTaxAmount as VlrBruto,
+        b~CreatedByUser,
+        bi~Subtotal2Amount AS ItemGrossValue,
+        CASE
+          WHEN acc~ClearingDate IS NOT INITIAL AND b~AccountingDocument IS NOT INITIAL THEN 'Quitado'
+          ELSE 'Em aberto'
+        END AS StatusPagto,
+        nf~BR_NFSNumber AS NFeOut,
+        viewproj~ProjectID as IdProjeto,
+        viewproj~WBSDescription as IdtProjeto,
+        acc~ClearingDate as ClearingDate,
+        acc~ClearingAccountingDocument as ClearingAccountingDocument,
+        b~AccountingDocument as AccountingDocument,
+        CASE WHEN acc~ClearingAccountingDocument IS NOT INITIAL
+          THEN
+              case when sub_aggr~TotalCreditAmount gt 0
+                   then sub_aggr~TotalCreditAmount
+                  else sub_aggr~DebitAmountInFunctionalCrcy
+               end
+        ELSE 0 END AS ValorPagtoLiq,
+        SalesOrder~FixedValueDate as FixedValueDate,
+        SalesOrder~PurchaseOrderByCustomer as Contrato,
+        SalesOrderItem~Product as Material,
+        bi~BillingDocumentItemText as TextoMaterial,
+        "Tax~BPTaxNumber as CNPJ,
+        CAST( nf~BR_NFPARTNERCNPJ AS CHAR( 14 ) ) as CNPJ,
+
+        " RECLASSIFICAÇÃO
+        case when SalesOrderItem~YY1_PROJETO1_SDI is initial then viewproj~ProjectID else viewreclass~ProjectElement end as ProjetoFinal,
+        case when SalesOrderItem~YY1_PROJETO1_SDI is initial then viewproj~WBSDescription else viewreclass~PROJECTELEMENTDESCRIPTION end as IdProjetoFinal,
+        SalesOrderItem~YY1_DataReclassificao_SDI as DtReclass,
+        SalesOrderItem~YY1_NDocContabil_SDI as DocReclass,
+        CASE WHEN SalesOrderItem~YY1_NDocContabil_SDI is not initial then accreclass_aggr~TotalDebitAmount ELSE bi~Subtotal2Amount END AS VlrProjFinal,
+        SalesOrderItem~YY1_GerenteSolicitante_SDI as Gerente,
+        bi~ReferenceSDDocument     as SalesOrder,
+        bi~ReferenceSDDocumentItem as SalesOrderItem
+        " _Texts~LongText as SalesOrderText " (Comentado conforme solicitado)
+
+      FROM I_BillingDocumentItem AS bi
+      INNER JOIN I_BillingDocument AS b ON bi~BillingDocument = b~BillingDocument
+      INNER JOIN I_BusinessPartner AS bp ON bp~BusinessPartner = b~SoldToParty
+      INNER JOIN I_SalesOrderItemCube( p_displaycurrency = 'BRL', p_exchangeratetype = 'N' ) AS SalesOrderItem
+        ON bi~ReferenceSDDocument = SalesOrderItem~SalesOrder
+        AND bi~ReferenceSDDocumentItem = SalesOrderItem~SalesOrderItem
+      INNER JOIN I_SalesOrder AS SalesOrder ON bi~ReferenceSDDocument = SalesOrder~SalesOrder
+      INNER JOIN I_BR_NFItem AS _J1BNFLIN
+         ON  bi~BillingDocument     = _J1BNFLIN~BR_NFSourceDocumentNumber
+         AND bi~BillingDocumentItem = _J1BNFLIN~BR_NFSourceDocumentItem
+         AND _J1BNFLIN~BR_NFSourceDocumentType = 'BI'
+      INNER JOIN I_BR_NFDocument AS nf ON nf~BR_NotaFiscal = _J1BNFLIN~BR_NotaFiscal
+      "LEFT JOIN I_BusinessPartnerTaxNumber AS Tax ON bi~SoldToParty = Tax~BusinessPartner AND Tax~BPTaxType = 'BR1'
+      LEFT JOIN zi_billing_proj_comp AS viewproj ON viewproj~BillingDocument = bi~BillingDocument
+                                                AND viewproj~BillingDocumentItem = bi~BillingDocumentItem
+      LEFT JOIN ZI_BILLING_ACCT_DOC_AGG AS acc  ON acc~BillingDocument = bi~BillingDocument
+                                               AND acc~BillingDocumentItem = bi~BillingDocumentItem
+                                               AND acc~Ledger = '0L'
+      LEFT JOIN I_EnterpriseProjectElement AS viewreclass ON viewreclass~ProjectElement = SalesOrderItem~YY1_PROJETO1_SDI
+
+      LEFT JOIN Z_I_PAYMENT_AGGR AS sub_aggr ON sub_aggr~AccountingDocument = acc~ClearingAccountingDocument
+                                            and sub_aggr~CompanyCode = acc~CompanyCode
+                                            and sub_aggr~FiscalYear = acc~FiscalYear
+                                            and acc~Ledger = '0L'
+      LEFT JOIN Z_I_RECLASS_AGGR AS accreclass_aggr ON accreclass_aggr~AccountingDocument = SalesOrderItem~YY1_NDocContabil_SDI
+
+      " === CLAUSULA WHERE ATUALIZADA (FATURAMENTO) ===
+      WHERE ( @lv_date_from IS INITIAL OR b~BillingDocumentDate >= @lv_date_from )
+        AND ( @lv_date_to   IS INITIAL OR b~BillingDocumentDate <= @lv_date_to   )
+        AND ( @lv_cust      IS INITIAL OR b~SoldToParty          = @lv_cust )
+        " -- Filtros Novos --
+        AND ( bi~Plant IN @lr_plant )
+        AND ( b~FiscalYear in @lr_gjahr )
+        AND ( viewproj~ProjectID IN @lr_project )
+        AND ( nf~BR_NFSNumber IN @lr_nfse )
+        AND ( b~BillingDocumentIsCancelled IN @lr_status_db )
+        AND ( ( @lv_check_paid = 'X' AND acc~ClearingDate IS NOT INITIAL ) OR
+              ( @lv_check_open = 'X' AND acc~ClearingDate IS INITIAL ) )
+
+      INTO CORRESPONDING FIELDS OF TABLE @lt_full_data.
+
+      " =====================================================================
+      " --- BLOCO 2: Writer (Nota Manual - LINHA ÚNICA C/ LOOKUP DE PROJETO) ---
+      " =====================================================================
+
+      DATA lt_writer_raw TYPE STANDARD TABLE OF zi_billing_min_q.
+
+      " 1. Seleção Principal: TRAZ APENAS O ITEM 001 (Valor Total / Cliente)
+      SELECT
+        _BSAD~AccountingDocument     AS DocNumberOut,
+
+        " Força conversão para garantir chave numérica
+        CAST( _BSAD~AccountingDocumentItem AS NUMC( 3 ) ) AS ItemNumber,
+
+        _BKPF~DocumentDate           AS DocDateOut,
+        _BSAD~Customer               AS CustomerId,
+        CAST( 'BRL' AS CHAR( 20 ) )  AS DocumentCurrency,
+        _BSAD~Plant                  AS Plant,
+        _BKPF~FiscalYear             AS FiscalYear,
+        _BKPF~ReverseDocument,
+        " === CORREÇÃO DO ERRO DE DECIMAL (CAST) ===
+        CASE WHEN _BSAD~AmountInTransactionCurrency > 0
+             THEN CAST( _BSAD~AmountInTransactionCurrency AS DEC( 23, 2 ) )
+             ELSE CAST( ( _BSAD~AmountInTransactionCurrency * -1 ) AS DEC( 23, 2 ) )
+        END AS VlrBruto,
+
+        _BSAD~AccountingDocCreatedByUser as CreatedByUser,
+
+        " === CORREÇÃO DO ERRO DE DECIMAL (CAST) ===
+        CASE WHEN _BSAD~AmountInTransactionCurrency > 0
+             THEN CAST( _BSAD~AmountInTransactionCurrency AS DEC( 23, 2 ) )
+             ELSE CAST( ( _BSAD~AmountInTransactionCurrency * -1 ) AS DEC( 23, 2 ) )
+        END AS ItemGrossValue,
+
+        CASE WHEN _BSAD~ClearingDate IS NOT INITIAL THEN 'Quitado' ELSE 'Em aberto' END AS StatusPagto,
+
+        _BSAD~ClearingDate           AS ClearingDate,
+        _BSAD~ClearingJournalEntry   AS ClearingAccountingDocument,
+        _BSAD~AccountingDocument     AS AccountingDocument,
+
+        CASE WHEN _BSAD~ClearingJournalEntry IS NOT INITIAL
+             THEN _BSAD~AmountInCompanyCodeCurrency
+             ELSE 0
+        END AS ValorPagtoLiq,
+
+        _BSAD~NetDueDate             AS FixedValueDate,
+        CAST( 'S/N' AS CHAR( 20 ) )  AS Contrato,
+        _BSAD~Product                AS Material,
+        _BSAD~DocumentItemText       AS TextoMaterial,
+
+        " Referência (XBLNR) para buscar a NF
+        _BKPF~DocumentReferenceID    AS NFeOut,
+        _BKPF~PostingDate,
+        _BKPF~CompanyCode,
+
+        " Placeholders
+        CAST( ' ' AS CHAR( 80 ) )     AS CustomerName,
+        CAST( ' ' AS CHAR( 10 ) )     AS StatusNF,
+        CAST( ' ' AS CHAR( 24 ) )     AS IdProjeto,
+        CAST( ' ' AS CHAR( 40 ) )     AS IdtProjeto,
+        CAST( ' ' AS CHAR( 14 ) )     AS CNPJ,
+        CAST( ' ' AS CHAR( 24 ) )     AS ProjetoFinal,
+        CAST( ' ' AS CHAR( 40 ) )     AS IdProjetoFinal,
+        CAST( '00000000' AS DATS )   AS DtReclass,
+        CAST( '0000000000' AS NUMC ) AS DocReclass,
+        CAST( 0 AS DEC( 15, 2 ) )    AS VlrProjFinal,
+        CAST( '0000000000' AS NUMC ) AS Gerente,
+        CAST( ' ' AS CHAR( 10 ) )    AS SalesOrder,
+        CAST( '000000' AS NUMC( 6 ) ) AS SalesOrderItem
+
+      FROM I_JournalEntry AS _BKPF
+      INNER JOIN I_JournalEntryItem AS _BSAD
+         ON _BSAD~CompanyCode        = _BKPF~CompanyCode
+        AND _BSAD~AccountingDocument = _BKPF~AccountingDocument
+        AND _BSAD~FiscalYear         = _BKPF~FiscalYear
+        AND _BSAD~AccountingDocumentType = 'DR'
+        AND _BSAD~Ledger             = '0L'
+
+      WHERE _BKPF~CompanyCode = 'BR01'
+        AND _BKPF~FiscalYear IN @lr_gjahr
+        AND ( @lv_date_from IS INITIAL OR _BKPF~DocumentDate >= @lv_date_from )
+        AND ( @lv_date_to   IS INITIAL OR _BKPF~DocumentDate <= @lv_date_to   )
+
+        " === RESTRINGE A APENAS 1 LINHA (TOTAL) ===
+        AND _BSAD~AccountingDocumentItem = '001'
+
+      INTO CORRESPONDING FIELDS OF TABLE @lt_writer_raw.
+
+      " ------------------------------------------------------------------
+      " 2. Enriquecimento
+      " ------------------------------------------------------------------
+      IF lt_writer_raw IS NOT INITIAL.
+
+        SORT lt_writer_raw BY DocNumberOut.
+
+        " A) Busca Dados da Nota Fiscal
+        SELECT
+           nfd~BR_NFSNumber AS DocumentReferenceID,
+           nfd~BR_NFPostingDate,
+           nfd~CompanyCode,
+           nfd~BR_NFPartner,
+           nfd~BR_NFPartnerName1,
+           nfd~BusinessPlace,
+           nfd~BR_NFPARTNERCNPJ,
+           nfd~BR_NFISCANCELED
+        FROM I_BR_NFDocument AS nfd
+        FOR ALL ENTRIES IN @lt_writer_raw
+        WHERE nfd~BR_NFSNumber = @lt_writer_raw-NFeOut
+        INTO TABLE @DATA(lt_nf_data).
+
+        SORT lt_nf_data BY DocumentReferenceID BR_NFPostingDate CompanyCode.
+
+        " B) Busca Projetos (CRUCIAL: Traz TODOS os itens do documento)
+        "    Mesmo que lt_writer_raw só tenha item 001, o WHERE abaixo pega o Doc inteiro.
+        SELECT
+           AccountingDocument,
+           AccountingDocumentItem,
+           ProjectID,
+           WBSDescription
+        FROM ZI_JOURNAL_PROJ_COMP
+        FOR ALL ENTRIES IN @lt_writer_raw
+        WHERE AccountingDocument = @lt_writer_raw-AccountingDocument
+          AND ProjectID IS NOT INITIAL " Já filtra quem tem projeto
+        INTO TABLE @DATA(lt_proj_data).
+
+        SORT lt_proj_data BY AccountingDocument.
+
+        " C) Busca Dados do Parceiro (Nome e CNPJ) separadamente (Evita Duplicidade)
+        DATA: lt_bp_keys TYPE SORTED TABLE OF I_JournalEntryItem WITH UNIQUE KEY Customer.
+        lt_bp_keys = CORRESPONDING #( lt_writer_raw DISCARDING DUPLICATES MAPPING Customer = CustomerId ).
+        DELETE lt_bp_keys WHERE Customer IS INITIAL.
+
+        IF lt_bp_keys IS NOT INITIAL.
+            SELECT
+                bp~BusinessPartner,
+                bp~BusinessPartnerFullName,
+                tax~BPTaxNumber
+            FROM I_BusinessPartner AS bp
+            LEFT JOIN I_BusinessPartnerTaxNumber AS tax
+                   ON bp~BusinessPartner = tax~BusinessPartner
+                  AND tax~BPTaxType = 'BR1'
+            FOR ALL ENTRIES IN @lt_bp_keys
+            WHERE bp~BusinessPartner = @lt_bp_keys-Customer
+            INTO TABLE @DATA(lt_bp_data).
+
+            SORT lt_bp_data BY BusinessPartner.
+        ENDIF.
+
+        " ------------------------------------------------------------------
+        " 3. Loop de Enriquecimento (Sem Buffer complexo, pois é linha única)
+        " ------------------------------------------------------------------
+        DATA: lt_writer_final TYPE STANDARD TABLE OF zi_billing_min_q.
+
+
+        LOOP AT lt_writer_raw INTO DATA(ls_row).
+
+          " --- Enrich: Projeto (A Lógica que você pediu) ---
+          " Varrer lt_proj_data (que tem itens 001, 002, 003...) para este documento
+          " e pegar o PRIMEIRO projeto que aparecer.
+          ls_row-VlrProjFinal   = ls_row-ItemGrossValue.
+
+          LOOP AT lt_proj_data INTO DATA(ls_proj) WHERE AccountingDocument = ls_row-AccountingDocument.
+             " Como já filtramos IS NOT INITIAL no SELECT, o primeiro que vier é válido.
+             ls_row-IdProjeto      = ls_proj-ProjectID.
+             ls_row-IdtProjeto     = ls_proj-WBSDescription.
+             ls_row-ProjetoFinal   = ls_proj-ProjectID.
+             ls_row-IdProjetoFinal = ls_proj-WBSDescription.
+
+             EXIT. " Achou o primeiro projeto (ex: no item 002), preenche e sai.
+          ENDLOOP.
+
+          " --- Enrich: Nota Fiscal ---
+          READ TABLE lt_nf_data INTO DATA(ls_nf)
+               WITH KEY DocumentReferenceID = ls_row-NFeOut
+                        BR_NFPostingDate    = ls_row-PostingDate
+                        CompanyCode         = 'BR01'
+               BINARY SEARCH.
+
+          IF sy-subrc = 0.
+             ls_row-CustomerName = ls_nf-BR_NFPartnerName1.
+             ls_row-CNPJ         = ls_nf-BR_NFPARTNERCNPJ.
+
+             IF ls_row-Plant IS INITIAL.
+                ls_row-Plant = ls_nf-BusinessPlace.
+             ENDIF.
+
+             CASE ls_nf-BR_NFISCANCELED.
+               WHEN 'X'. ls_row-StatusNF = 'Cancelado'.
+               WHEN OTHERS. ls_row-StatusNF = 'Emitida'.
+             ENDCASE.
+
+             if ls_row-ReverseDocument is not initial.
+                ls_row-StatusNF = 'Cancelado'.
+             else.
+                ls_row-StatusNF = 'Emitida'.
+             endif.
+          ELSE.
+             " Sem NF: Tenta pegar nome do BP
+             IF ls_row-CustomerId IS NOT INITIAL.
+                READ TABLE lt_bp_data INTO DATA(ls_bp)
+                     WITH KEY BusinessPartner = ls_row-CustomerId BINARY SEARCH.
+                IF sy-subrc = 0.
+                    ls_row-CustomerName = ls_bp-BusinessPartnerFullName.
+                    ls_row-CNPJ         = ls_bp-BPTaxNumber.
+                ENDIF.
+             ENDIF.
+             ls_row-StatusNF = 'Cancelado'.
+          ENDIF.
+
+          " ------------------------------------------------------------------
+          " 4. Filtros Manuais
+          " ------------------------------------------------------------------
+          IF lv_check_paid = abap_true AND lv_check_open = abap_false.
+             IF ls_row-StatusPagto <> 'Quitado'. CONTINUE. ENDIF.
+          ELSEIF lv_check_paid = abap_false AND lv_check_open = abap_true.
+             IF ls_row-StatusPagto <> 'Em aberto'. CONTINUE. ENDIF.
+          ENDIF.
+
+          IF lv_cust IS NOT INITIAL AND ls_row-CustomerId <> lv_cust. CONTINUE. ENDIF.
+          IF lr_plant IS NOT INITIAL AND ls_row-Plant NOT IN lr_plant. CONTINUE. ENDIF.
+
+          " O Filtro de Projeto agora funciona pois preenchemos ls_row com o projeto do item 002/004
+          IF lr_project IS NOT INITIAL AND ls_row-IdProjeto NOT IN lr_project. CONTINUE. ENDIF.
+
+          IF lr_nfse IS NOT INITIAL AND ls_row-NFeOut NOT IN lr_nfse. CONTINUE. ENDIF.
+
+          IF lr_status_db IS NOT INITIAL.
+              IF ls_row-StatusNF = 'Cancelado'.
+                 IF 'X' NOT IN lr_status_db. CONTINUE. ENDIF.
+              ELSE.
+                 IF ' ' NOT IN lr_status_db AND '' NOT IN lr_status_db. CONTINUE. ENDIF.
+              ENDIF.
+          ENDIF.
+
+          " Adiciona à lista final
+          APPEND ls_row TO lt_writer_final.
+
+        ENDLOOP.
+
+        " 5. Junta o resultado do Writer na tabela Principal
+        APPEND LINES OF lt_writer_final TO lt_full_data.
+
+      ENDIF.
+
+      " =====================================================================
+      " === PAGINAÇÃO E RETORNO FINAL ===
+      " =====================================================================
+
+      " Ordena tudo junto (Faturamento + Writer) para garantir paginação correta
+      SORT lt_full_data BY DocNumberOut ItemNumber.
+
+      DATA lv_total_lines type int8.
+
+      lv_total_lines = lines( lt_full_data ).
+      DATA(lv_to) = lv_offset + lv_pagesize.
+
+      IF lv_to > lv_total_lines. lv_to = lv_total_lines. ENDIF.
+
+      IF lv_offset < lv_total_lines.
+          LOOP AT lt_full_data INTO DATA(ls_page_row) FROM ( lv_offset + 1 ) TO lv_to.
+             APPEND ls_page_row TO lt_page.
+          ENDLOOP.
+      ENDIF.
+
+      io_response->set_data( lt_page ).
+
+      IF l_wants_count <> abap_true.
+        " Nota: Se você já calculou o count no bloco 1, precisa somar com este aqui
+         "io_response->set_total_number_of_records( lines( lt_page ) + lv_total_fat ).
+         io_response->set_total_number_of_records( lv_total_lines ).
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.
+ENDCLASS.
