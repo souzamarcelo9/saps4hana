@@ -1,0 +1,317 @@
+DATA ls_itemout TYPE fins_acdoc_out.
+    DATA: lv_text_to_apply TYPE string,
+          lv_supplier      TYPE lifnr,
+          lv_customer      TYPE kunnr,
+          lv_name          TYPE string,
+          lv_nf            TYPE string,
+          lv_belnr   type belnr_d.
+
+    DATA(lv_is_new_post) = abap_false.
+
+    CLEAR accountingdocitemsout.
+
+    CASE accountingdocheader-accountingdocumenttype.
+
+  " =======================================================================
+      " BLOCO 1: COMPRAS (RE - MIRO) - BUSCA EM ITENS UNCOMPRESSED
+      " =======================================================================
+ WHEN 'RE' or  'ZR' or  'SA'  or  'KA'.
+
+        DATA lv_debug_info(50)  type c.
+
+        " Verifica se acha nos itens
+        LOOP AT accountingdocitems REFERENCE INTO DATA(lr_d) WHERE documentitemtext IS NOT INITIAL.
+            lv_debug_info = lr_d->documentitemtext.
+            EXIT.
+        ENDLOOP.
+
+        " Verifica se acha na Uncompressed
+        IF uncompresseditems IS NOT INITIAL.
+            LOOP AT uncompresseditems REFERENCE INTO DATA(lr_u) WHERE documentitemtext IS NOT INITIAL.
+             lv_debug_info = lr_u->documentitemtext.
+                EXIT.
+            ENDLOOP.
+        ENDIF.
+
+        " Aplica o 'Relatório' em todas as linhas
+        LOOP AT accountingdocitems REFERENCE INTO DATA(lr_apply).
+          MOVE-CORRESPONDING lr_apply->* TO ls_itemout.
+          ls_itemout-documentitemtext = lv_debug_info. " O texto do item será o nosso LOG
+          APPEND ls_itemout TO accountingdocitemsout.
+          substitutiondone = abap_true.
+        ENDLOOP.
+
+      " =======================================================================
+      " BLOCO 2: LANÇAMENTOS FINANCEIROS (KR, DR, FB60, FB70)
+      " =======================================================================
+      WHEN 'KR' OR 'DR'.
+        lv_text_to_apply = accountingdocheader-accountingdocumentheadertext.
+
+        IF lv_text_to_apply IS INITIAL.
+          LOOP AT accountingdocitems REFERENCE INTO DATA(lr_scan_kr)
+            WHERE documentitemtext IS NOT INITIAL AND NOT ( documentitemtext CP 'REF:*' ).
+            lv_text_to_apply = lr_scan_kr->documentitemtext.
+            EXIT.
+          ENDLOOP.
+        ENDIF.
+
+        IF lv_text_to_apply IS INITIAL.
+          lv_text_to_apply = |REF: { accountingdocheader-accountingdocexternalreference }|.
+        ENDIF.
+
+        LOOP AT accountingdocitems REFERENCE INTO DATA(lr_item_kr).
+          " Comparamos se precisa de substituição
+          IF lr_item_kr->documentitemtext IS INITIAL OR lr_item_kr->documentitemtext CP 'REF:*'.
+            MOVE-CORRESPONDING lr_item_kr->* TO ls_itemout.
+            ls_itemout-documentitemtext = substring( val = lv_text_to_apply off = 0
+                                           len = COND #( WHEN strlen( lv_text_to_apply ) > 50 THEN 50 ELSE strlen( lv_text_to_apply ) ) ).
+            APPEND ls_itemout TO accountingdocitemsout.
+            substitutiondone = abap_true.
+          ENDIF.
+        ENDLOOP.
+
+  " =======================================================================
+      " BLOCO 5: VENDAS (RV) - FATURAMENTO SD
+      " =======================================================================
+      WHEN 'RV'.
+        " 1. Busca o Cliente (Varredura em Itens e Uncompressed)
+        LOOP AT accountingdocitems REFERENCE INTO DATA(lr_rv_c) WHERE customer IS NOT INITIAL.
+            lv_customer = lr_rv_c->customer.
+            EXIT.
+        ENDLOOP.
+
+        IF lv_customer IS INITIAL.
+            LOOP AT uncompresseditems REFERENCE INTO DATA(lr_rv_un) WHERE customer IS NOT INITIAL.
+                lv_customer = lr_rv_un->customer.
+                EXIT.
+            ENDLOOP.
+        ENDIF.
+
+        " 2. Busca o Nome do Cliente
+        IF lv_customer IS NOT INITIAL.
+            SELECT SINGLE businesspartnername FROM i_businesspartner WITH PRIVILEGED ACCESS
+              WHERE businesspartner = @lv_customer INTO @lv_name.
+        ENDIF.
+
+        " 3. Busca o número da NF / Fatura
+        " Prioridade 1: Referência Externa (XBLNR)
+        " Prioridade 2: OriginalReferenceDocument (Número da Fatura SD)
+        lv_nf = accountingdocheader-accountingdocexternalreference.
+        IF lv_nf IS INITIAL.
+            lv_nf = accountingdocheader-originalreferencedocument(10).
+        ENDIF.
+
+        " 4. Monta o Texto
+        lv_text_to_apply = |NF { lv_nf } REF: { lv_customer } { lv_name }|.
+
+        " 5. APLICAÇÃO EM MASSA (Sem filtros para garantir que pegue Receita e Impostos)
+        LOOP AT accountingdocitems REFERENCE INTO DATA(lr_apply_rv).
+          CLEAR ls_itemout.
+          MOVE-CORRESPONDING lr_apply_rv->* TO ls_itemout.
+
+          ls_itemout-documentitemtext = substring( val = lv_text_to_apply off = 0
+                                         len = COND #( WHEN strlen( lv_text_to_apply ) > 50 THEN 50
+                                                       ELSE strlen( lv_text_to_apply ) ) ).
+
+          APPEND ls_itemout TO accountingdocitemsout.
+          substitutiondone = abap_true.
+        ENDLOOP.
+
+  " =======================================================================
+      " BLOCO 4: RECEBIMENTO CLIENTE (DZ) - VARREDURA DE TEXTO MANUAL
+      " =======================================================================
+      WHEN 'DZ'.
+        " 1. PASSO DE VARREDURA: Procura o texto que o usuário digitou na F-28
+        " Tenta no cabeçalho primeiro
+        lv_text_to_apply = accountingdocheader-accountingdocumentheadertext.
+
+        " Se vazio, busca nas linhas (Onde o usuário geralmente digita no DZ)
+        IF lv_text_to_apply IS INITIAL.
+            LOOP AT accountingdocitems REFERENCE INTO DATA(lr_scan_dz)
+              WHERE documentitemtext IS NOT INITIAL.
+                lv_text_to_apply = lr_scan_dz->documentitemtext.
+                EXIT.
+            ENDLOOP.
+        ENDIF.
+
+        " Se ainda vazio, busca na Uncompressed (Seguro para buffer de tela)
+        IF lv_text_to_apply IS INITIAL.
+            LOOP AT uncompresseditems REFERENCE INTO DATA(lr_uncom_dz)
+              WHERE documentitemtext IS NOT INITIAL.
+                lv_text_to_apply = lr_uncom_dz->documentitemtext.
+                EXIT.
+            ENDLOOP.
+        ENDIF.
+
+        " 2. APLICAÇÃO: Se encontrou o texto, replica para TODOS os itens
+        IF lv_text_to_apply IS NOT INITIAL.
+          LOOP AT accountingdocitems REFERENCE INTO DATA(lr_apply_dz).
+            CLEAR ls_itemout.
+            MOVE-CORRESPONDING lr_apply_dz->* TO ls_itemout.
+
+            ls_itemout-documentitemtext = substring( val = lv_text_to_apply off = 0
+                                           len = COND #( WHEN strlen( lv_text_to_apply ) > 50 THEN 50
+                                                         ELSE strlen( lv_text_to_apply ) ) ).
+
+            APPEND ls_itemout TO accountingdocitemsout.
+            substitutiondone = abap_true.
+          ENDLOOP.
+        ENDIF.
+
+
+  " =======================================================================
+      " BLOCO ZP: PAGAMENTO AUTOMÁTICO VIA PROPOSTA (I_PAYMENTPROPOSALITEM)
+      " =======================================================================
+
+      WHEN 'ZP'.
+        DATA: lv_run_date TYPE d,
+              lv_run_id   TYPE c LENGTH 6,
+              lv_header_txt TYPE string,
+              lv_dash_pos  TYPE i,
+              lv_year TYPE gjahr.
+
+        lv_header_txt = accountingdocheader-accountingdocumentheadertext.
+
+        " 1. FORMATAÇÃO DINÂMICA: Procura a posição do hífen '-'
+        " Exemplo esperado: '20260318-FRA18'
+        IF lv_header_txt CA '-'.
+            " Encontra a posição do hífen (base 0)
+            FIND FIRST OCCURRENCE OF '-' IN lv_header_txt MATCH OFFSET lv_dash_pos.
+
+            " A data são os caracteres ANTES do hífen
+            lv_run_date = lv_header_txt(lv_dash_pos).
+
+            " O ID são os caracteres DEPOIS do hífen (+1 para pular o traço)
+            DATA(lv_start_id) = lv_dash_pos + 1.
+            lv_run_id = lv_header_txt+lv_start_id.
+
+            " 2. BUSCA NA PROPOSTA: Usa a data e ID extraídos
+            SELECT SINGLE AccountingDocument, FiscalYear
+              FROM I_PaymentProposalItem WITH PRIVILEGED ACCESS
+              WHERE PaymentRunDate = @lv_run_date
+                AND PaymentRunID   = @lv_run_id
+                AND CompanyCode    = @accountingdocheader-companycode
+                AND ( AccountingDocumentType = 'RE' OR AccountingDocumentType = 'KR'  OR AccountingDocumentType = 'KA')
+              INTO (@lv_belnr, @lv_year).
+        ENDIF.
+
+        " 3. BUSCA O TEXTO: Se achou a fatura na proposta, pega o texto dela
+        IF lv_belnr IS NOT INITIAL.
+            SELECT SINGLE documentitemtext
+              FROM i_journalentryitem WITH PRIVILEGED ACCESS
+              WHERE companycode        = @accountingdocheader-companycode
+                AND fiscalyear         = @lv_year
+                AND accountingdocument = @lv_belnr
+                AND documentitemtext   <> ''
+                AND ledger             = '0L'
+              INTO @lv_text_to_apply.
+        ENDIF.
+
+        " 4. APLICAÇÃO: (Mesma lógica de soberania do usuário que discutimos)
+        LOOP AT accountingdocitems REFERENCE INTO DATA(lr_zp_apply).
+          " Se for modificação e já tiver texto, respeita o usuário
+          IF lv_is_new_post = abap_false AND lr_zp_apply->documentitemtext IS NOT INITIAL.
+             CONTINUE.
+          ENDIF.
+
+          CLEAR ls_itemout.
+          MOVE-CORRESPONDING lr_zp_apply->* TO ls_itemout.
+
+          IF lv_text_to_apply IS NOT INITIAL.
+             ls_itemout-documentitemtext = lv_text_to_apply.
+          ELSE.
+             " Fallback caso não encontre a fatura na proposta
+             ls_itemout-documentitemtext = |PROPOSTA: { lv_run_id } DATA: { lv_run_date+6(2) }/{ lv_run_date+4(2) }|.
+          ENDIF.
+
+          APPEND ls_itemout TO accountingdocitemsout.
+          substitutiondone = abap_true.
+        ENDLOOP.
+
+  " =======================================================================
+      " BLCO 5:COMPENSAÇÕES (KZ, ZP, SU) - HERANÇA TOTAL DA ORIGEM
+      " =======================================================================
+ WHEN 'SU'  OR 'KZ'.
+      DATA: lv_belnr_orig TYPE belnr_d,
+            lv_year_orig  TYPE gjahr.
+
+      " --- PASSO 1: LOCALIZAR O DOCUMENTO DE ORIGEM ---
+
+      " Tenta pela Invoice Reference nos itens normais
+      LOOP AT accountingdocitems REFERENCE INTO DATA(lr_ref) WHERE invoicereference IS NOT INITIAL.
+        lv_belnr_orig = lr_ref->invoicereference(10).
+        lv_year_orig  = lr_ref->CLEARINGDATE(4).
+        EXIT.
+      ENDLOOP.
+
+      " Se não achou, tenta na Uncompressed (importante para F-53)
+      IF lv_belnr_orig IS INITIAL.
+        LOOP AT uncompresseditems REFERENCE INTO DATA(lr_uncom) WHERE invoicereference IS NOT INITIAL.
+          lv_belnr_orig = lr_uncom->invoicereference(10).
+          lv_year_orig  = lr_uncom->fiscalyear.
+          EXIT.
+        ENDLOOP.
+      ENDIF.
+
+      " Se ainda não achou, usa a Referência (XBLNR) que você digitou
+      IF lv_belnr_orig IS INITIAL AND accountingdocheader-accountingdocexternalreference IS NOT INITIAL.
+        SELECT SINGLE accountingdocument, fiscalyear
+          FROM i_journalentry WITH PRIVILEGED ACCESS
+          WHERE companycode = @accountingdocheader-companycode
+            AND documentreferenceid = @accountingdocheader-accountingdocexternalreference
+            AND ( accountingdocumenttype = 'RE' OR accountingdocumenttype = 'KR'  OR accountingdocumenttype = 'KA' OR accountingdocumenttype = 'ZR' )
+          INTO (@lv_belnr_orig, @lv_year_orig).
+      ENDIF.
+
+      " --- PASSO 2: BUSCAR O TEXTO NO DOCUMENTO ACHADO ---
+      IF lv_belnr_orig IS NOT INITIAL.
+        SELECT SINGLE documentitemtext
+          FROM i_journalentryitem WITH PRIVILEGED ACCESS
+          WHERE companycode        = @accountingdocheader-companycode
+            AND fiscalyear         = @lv_year_orig
+            AND accountingdocument = @lv_belnr_orig
+            AND documentitemtext   <> ''
+            AND ledger             = '0L'
+          INTO @lv_text_to_apply.
+      ENDIF.
+
+  " --- PASSO 3: APLICAÇÃO FINAL (SEM ROWINDEX) ---
+      LOOP AT accountingdocitems REFERENCE INTO DATA(lr_final).
+        CLEAR ls_itemout.
+        MOVE-CORRESPONDING lr_final->* TO ls_itemout.
+
+        IF lv_text_to_apply IS NOT INITIAL.
+          " Se achamos o texto da fatura original, aplicamos
+          ls_itemout-documentitemtext = lv_text_to_apply.
+        ELSE.
+          " Fallback 1: Tenta pegar o primeiro texto manual que existir na uncompressed
+          LOOP AT uncompresseditems REFERENCE INTO DATA(lr_dbg)
+            WHERE documentitemtext IS NOT INITIAL OR assignmentreference IS NOT INITIAL.
+              ls_itemout-documentitemtext = |{ lr_dbg->assignmentreference } { lr_dbg->documentitemtext }|.
+              EXIT. " Pega o primeiro e sai
+          ENDLOOP.
+
+          " Fallback 2: Se ainda assim estiver vazio, usa a Referência do cabeçalho
+          IF ls_itemout-documentitemtext IS INITIAL OR ls_itemout-documentitemtext = ' '.
+             ls_itemout-documentitemtext = |REF: { accountingdocheader-accountingdocexternalreference }|.
+          ENDIF.
+        ENDIF.
+
+        APPEND ls_itemout TO accountingdocitemsout.
+        substitutiondone = abap_true.
+      ENDLOOP.
+
+      " =======================================================================
+      " BLOCO 5: IMOBILIZADO (AR, AA)
+      " =======================================================================
+      WHEN 'AR' OR 'AA'.
+        LOOP AT accountingdocitems REFERENCE INTO DATA(lr_item_asset).
+          IF lr_item_asset->masterfixedasset IS NOT INITIAL.
+            MOVE-CORRESPONDING lr_item_asset->* TO ls_itemout.
+            ls_itemout-documentitemtext = |Ativo: { lr_item_asset->masterfixedasset }-{ lr_item_asset->fixedasset }|.
+            APPEND ls_itemout TO accountingdocitemsout.
+            substitutiondone = abap_true.
+          ENDIF.
+        ENDLOOP.
+
+    ENDCASE.
