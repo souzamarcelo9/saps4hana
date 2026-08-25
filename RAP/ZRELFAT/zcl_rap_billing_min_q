@@ -3,7 +3,10 @@ CLASS zcl_rap_billing_min_q DEFINITION PUBLIC FINAL CREATE PUBLIC.
     INTERFACES if_rap_query_provider.
 ENDCLASS.
 
-CLASS zcl_rap_billing_min_q IMPLEMENTATION.
+
+
+CLASS ZCL_RAP_BILLING_MIN_Q IMPLEMENTATION.
+
 
   METHOD if_rap_query_provider~select.
 
@@ -108,7 +111,7 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
     ENDIF.
 
     "=== 3) COUNT total ===
-    IF l_wants_count = abap_true.
+    IF l_wants_count = abap_true AND l_wants_data = abap_false.
       DATA: lv_total_fat TYPE int8,
             lv_total_wri TYPE int8.
 
@@ -142,6 +145,14 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
           " Lógica Pagamento (Quitado = Data Preenchida OR Em Aberto = Data Vazia)
           AND ( ( @lv_check_paid = 'X' AND acc~ClearingDate IS NOT INITIAL ) OR
                 ( @lv_check_open = 'X' AND acc~ClearingDate IS INITIAL ) )
+          " ---> INÍCIO DA INCLUSÃO: Exclui faturamentos gerados a partir de estornos (CRB)
+          AND NOT EXISTS (
+              SELECT 1 FROM I_CreditMemoRequest AS cred
+              WHERE cred~CreditMemoRequest     = bi~ReferenceSDDocument
+                AND cred~CreditMemoRequestType = 'CRB'
+          )
+          " ---> FIM DA INCLUSÃO
+
         INTO @lv_total_fat.
 
 **********************************************************************
@@ -171,13 +182,13 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
           _BKPF~CompanyCode = 'BR01'
           "AND _BKPF~Ledger = '0L'
           AND ( _BKPF~FiscalYear in @lr_gjahr )
-          AND ( nfd~BR_NFIsCanceled IN @lr_status_db )
+          "AND ( nfd~BR_NFIsCanceled IN @lr_status_db )
           AND ( @lv_date_from IS INITIAL OR _BKPF~DocumentDate >= @lv_date_from )
           AND ( @lv_date_to   IS INITIAL OR _BKPF~DocumentDate <= @lv_date_to   )
           AND ( @lv_cust      IS INITIAL OR nfd~BR_NFPartner    = @lv_cust )
           " Novos Filtros Writer
           AND ( nfd~BusinessPlace IN @lr_plant )    " Centro (Writer usa BusinessPlace)
-          AND ( viewproj~ProjectID IN @lr_project ) " Projeto
+          "AND ( viewproj~ProjectID IN @lr_project ) " Projeto
           AND ( nfd~BR_NFSNumber IN @lr_nfse )      " NFSe
           " Nota: Writer filtrada aqui sempre assume 'Emitida' pois filtramos Canceled='' acima.
           AND ( ( @lv_check_paid = 'X' AND _BSAD~ClearingDate IS NOT INITIAL ) OR ( @lv_check_open = 'X' AND _BSAD~ClearingDate IS INITIAL ) )
@@ -187,6 +198,7 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
         INTO @lv_total_wri.
 
       io_response->set_total_number_of_records( lv_total_fat + lv_total_wri ).
+      return.
     ENDIF.
 
 **********************************************************************
@@ -227,7 +239,7 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
           THEN
               case when sub_aggr~TotalCreditAmount gt 0
                    then sub_aggr~TotalCreditAmount
-                  else sub_aggr~DebitAmountInFunctionalCrcy
+                  else sub_aggr~DebitAmountInCoCodeCrcy
                end
         ELSE 0 END AS ValorPagtoLiq,
         SalesOrder~FixedValueDate as FixedValueDate,
@@ -235,14 +247,18 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
         SalesOrderItem~Product as Material,
         bi~BillingDocumentItemText as TextoMaterial,
         "Tax~BPTaxNumber as CNPJ,
-        CAST( nf~BR_NFPARTNERCNPJ AS CHAR( 14 ) ) as CNPJ,
+        CAST( nf~BR_NFPARTNERCNPJ_2 AS CHAR( 14 ) ) as CNPJ,
 
         " RECLASSIFICAÇÃO
         case when SalesOrderItem~YY1_PROJETO1_SDI is initial then viewproj~ProjectID else viewreclass~ProjectElement end as ProjetoFinal,
         case when SalesOrderItem~YY1_PROJETO1_SDI is initial then viewproj~WBSDescription else viewreclass~PROJECTELEMENTDESCRIPTION end as IdProjetoFinal,
         SalesOrderItem~YY1_DataReclassificao_SDI as DtReclass,
         SalesOrderItem~YY1_NDocContabil_SDI as DocReclass,
-        CASE WHEN SalesOrderItem~YY1_NDocContabil_SDI is not initial then accreclass_aggr~TotalDebitAmount ELSE bi~Subtotal2Amount END AS VlrProjFinal,
+
+        CASE WHEN SalesOrderItem~YY1_NDocContabil_SDI is not initial
+            then accreclass_aggr~TotalDebitAmount
+            ELSE bi~Subtotal2Amount
+            END AS VlrProjFinal,
         SalesOrderItem~YY1_GerenteSolicitante_SDI as Gerente,
         bi~ReferenceSDDocument     as SalesOrder,
         bi~ReferenceSDDocumentItem as SalesOrderItem
@@ -272,7 +288,10 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
                                             and sub_aggr~CompanyCode = acc~CompanyCode
                                             and sub_aggr~FiscalYear = acc~FiscalYear
                                             and acc~Ledger = '0L'
-      LEFT JOIN Z_I_RECLASS_AGGR AS accreclass_aggr ON accreclass_aggr~AccountingDocument = SalesOrderItem~YY1_NDocContabil_SDI
+
+      LEFT JOIN Z_I_RECLASS_AGGR AS accreclass_aggr ON  accreclass_aggr~AccountingDocument = SalesOrderItem~YY1_NDocContabil_SDI
+                                                      AND accreclass_aggr~CompanyCode = b~CompanyCode
+                                                      AND accreclass_aggr~FiscalYear = b~FiscalYear
 
       " === CLAUSULA WHERE ATUALIZADA (FATURAMENTO) ===
       WHERE ( @lv_date_from IS INITIAL OR b~BillingDocumentDate >= @lv_date_from )
@@ -286,6 +305,13 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
         AND ( b~BillingDocumentIsCancelled IN @lr_status_db )
         AND ( ( @lv_check_paid = 'X' AND acc~ClearingDate IS NOT INITIAL ) OR
               ( @lv_check_open = 'X' AND acc~ClearingDate IS INITIAL ) )
+        " ---> INÍCIO DA INCLUSÃO: Exclui faturamentos gerados a partir de estornos (CRB)
+        AND NOT EXISTS (
+            SELECT 1 FROM I_CreditMemoRequest AS cred
+            WHERE cred~CreditMemoRequest     = bi~ReferenceSDDocument
+              AND cred~CreditMemoRequestType = 'CRB'
+        )
+        " ---> FIM DA INCLUSÃO
 
       INTO CORRESPONDING FIELDS OF TABLE @lt_full_data.
 
@@ -397,7 +423,7 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
            nfd~BR_NFPartner,
            nfd~BR_NFPartnerName1,
            nfd~BusinessPlace,
-           nfd~BR_NFPARTNERCNPJ,
+           nfd~BR_NFPARTNERCNPJ_2,
            nfd~BR_NFISCANCELED
         FROM I_BR_NFDocument AS nfd
         FOR ALL ENTRIES IN @lt_writer_raw
@@ -411,15 +437,19 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
         SELECT
            AccountingDocument,
            AccountingDocumentItem,
+           FiscalYear,
            ProjectID,
-           WBSDescription
+           WBSDescription,
+           TotalCreditAmount,
+           DebitAmountInFunctionalCrcy
         FROM ZI_JOURNAL_PROJ_COMP
         FOR ALL ENTRIES IN @lt_writer_raw
         WHERE AccountingDocument = @lt_writer_raw-AccountingDocument
-          AND ProjectID IS NOT INITIAL " Já filtra quem tem projeto
+                and FiscalYear = @lt_writer_raw-FiscalYear
+          "AND ProjectID IS NOT INITIAL " Já filtra quem tem projeto
         INTO TABLE @DATA(lt_proj_data).
 
-        SORT lt_proj_data BY AccountingDocument.
+        SORT lt_proj_data BY AccountingDocument AccountingDocumentItem.
 
         " C) Busca Dados do Parceiro (Nome e CNPJ) separadamente (Evita Duplicidade)
         DATA: lt_bp_keys TYPE SORTED TABLE OF I_JournalEntryItem WITH UNIQUE KEY Customer.
@@ -450,22 +480,10 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
 
         LOOP AT lt_writer_raw INTO DATA(ls_row).
 
-          " --- Enrich: Projeto (A Lógica que você pediu) ---
-          " Varrer lt_proj_data (que tem itens 001, 002, 003...) para este documento
-          " e pegar o PRIMEIRO projeto que aparecer.
-          ls_row-VlrProjFinal   = ls_row-ItemGrossValue.
+          " Flag para controlar se já processamos o Item 001 deste documento
+          DATA(lv_item1_processed) = abap_false.
 
-          LOOP AT lt_proj_data INTO DATA(ls_proj) WHERE AccountingDocument = ls_row-AccountingDocument.
-             " Como já filtramos IS NOT INITIAL no SELECT, o primeiro que vier é válido.
-             ls_row-IdProjeto      = ls_proj-ProjectID.
-             ls_row-IdtProjeto     = ls_proj-WBSDescription.
-             ls_row-ProjetoFinal   = ls_proj-ProjectID.
-             ls_row-IdProjetoFinal = ls_proj-WBSDescription.
-
-             EXIT. " Achou o primeiro projeto (ex: no item 002), preenche e sai.
-          ENDLOOP.
-
-          " --- Enrich: Nota Fiscal ---
+          " --- Enrich: Nota Fiscal e Status (Mantido igual) ---
           READ TABLE lt_nf_data INTO DATA(ls_nf)
                WITH KEY DocumentReferenceID = ls_row-NFeOut
                         BR_NFPostingDate    = ls_row-PostingDate
@@ -474,37 +492,35 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
 
           IF sy-subrc = 0.
              ls_row-CustomerName = ls_nf-BR_NFPartnerName1.
-             ls_row-CNPJ         = ls_nf-BR_NFPARTNERCNPJ.
+             ls_row-CNPJ         = ls_nf-BR_NFPARTNERCNPJ_2.
+             IF ls_row-Plant IS INITIAL. ls_row-Plant = ls_nf-BusinessPlace. ENDIF.
 
-             IF ls_row-Plant IS INITIAL.
-                ls_row-Plant = ls_nf-BusinessPlace.
-             ENDIF.
-
-             CASE ls_nf-BR_NFISCANCELED.
-               WHEN 'X'. ls_row-StatusNF = 'Cancelado'.
-               WHEN OTHERS. ls_row-StatusNF = 'Emitida'.
-             ENDCASE.
-
-             if ls_row-ReverseDocument is not initial.
+             " Regra de Status NF
+             IF ls_row-ReverseDocument IS NOT INITIAL." OR ls_nf-BR_NFISCANCELED = 'X'.
                 ls_row-StatusNF = 'Cancelado'.
-             else.
+             ELSE.
                 ls_row-StatusNF = 'Emitida'.
-             endif.
+             ENDIF.
           ELSE.
              " Sem NF: Tenta pegar nome do BP
              IF ls_row-CustomerId IS NOT INITIAL.
-                READ TABLE lt_bp_data INTO DATA(ls_bp)
-                     WITH KEY BusinessPartner = ls_row-CustomerId BINARY SEARCH.
+                READ TABLE lt_bp_data INTO DATA(ls_bp) WITH KEY BusinessPartner = ls_row-CustomerId BINARY SEARCH.
                 IF sy-subrc = 0.
                     ls_row-CustomerName = ls_bp-BusinessPartnerFullName.
                     ls_row-CNPJ         = ls_bp-BPTaxNumber.
                 ENDIF.
              ENDIF.
-             ls_row-StatusNF = 'Cancelado'.
+
+             " Se tem estorno, é cancelado, senão emitida (mesmo sem NF)
+             IF ls_row-ReverseDocument IS NOT INITIAL.
+                 ls_row-StatusNF = 'Cancelado'.
+             ELSE.
+                 ls_row-StatusNF = 'Emitida'.
+             ENDIF.
           ENDIF.
 
           " ------------------------------------------------------------------
-          " 4. Filtros Manuais
+          " 4. Filtros Manuais (Antes de duplicar linhas)
           " ------------------------------------------------------------------
           IF lv_check_paid = abap_true AND lv_check_open = abap_false.
              IF ls_row-StatusPagto <> 'Quitado'. CONTINUE. ENDIF.
@@ -514,25 +530,79 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
 
           IF lv_cust IS NOT INITIAL AND ls_row-CustomerId <> lv_cust. CONTINUE. ENDIF.
           IF lr_plant IS NOT INITIAL AND ls_row-Plant NOT IN lr_plant. CONTINUE. ENDIF.
-
-          " O Filtro de Projeto agora funciona pois preenchemos ls_row com o projeto do item 002/004
-          IF lr_project IS NOT INITIAL AND ls_row-IdProjeto NOT IN lr_project. CONTINUE. ENDIF.
-
           IF lr_nfse IS NOT INITIAL AND ls_row-NFeOut NOT IN lr_nfse. CONTINUE. ENDIF.
 
+          " Status NF Filter
           IF lr_status_db IS NOT INITIAL.
               IF ls_row-StatusNF = 'Cancelado'.
-                 IF 'X' NOT IN lr_status_db. CONTINUE.
-                 ENDIF.
+                 IF 'X' NOT IN lr_status_db. CONTINUE. ENDIF.
               ELSE.
-                 IF ' ' NOT IN lr_status_db AND '' NOT IN lr_status_db.
-                  CONTINUE.
-                 ENDIF.
+                 IF ' ' NOT IN lr_status_db AND '' NOT IN lr_status_db. CONTINUE. ENDIF.
               ENDIF.
           ENDIF.
 
-          " Adiciona à lista final
-          APPEND ls_row TO lt_writer_final.
+          " ====================================================================
+          " PROJETOS - Lógica "Pai e Filhos"
+          " ====================================================================
+
+          " Varrer lt_proj_data para encontrar itens deste documento
+          LOOP AT lt_proj_data INTO DATA(ls_proj)
+               WHERE AccountingDocument = ls_row-AccountingDocument
+                 AND FiscalYear         = ls_row-FiscalYear.
+
+             " CASO A: É o Item 001 (A linha principal que já temos em mãos)
+             IF ls_proj-AccountingDocumentItem = '001' or ls_proj-AccountingDocumentItem = '000001'.
+
+               IF lv_item1_processed = abap_false.
+                   " Enriquecemos a linha principal com o projeto (se tiver)
+                   ls_row-IdProjeto      = ls_proj-ProjectID.
+                   ls_row-IdtProjeto     = ls_proj-WBSDescription.
+                   ls_row-ProjetoFinal   = ls_proj-ProjectID.
+                   ls_row-IdProjetoFinal = ls_proj-WBSDescription.
+
+                   " O valor do Item 1 mantém o original do Writer (Total/Bruto)
+                   " ou usa o valor do projeto se for regra específica.
+                   " Geralmente Item 1 Writer = Total a Receber.
+                   ls_row-VlrProjFinal = ls_proj-DebitAmountInFunctionalCrcy.
+
+                   APPEND ls_row TO lt_writer_final.
+                   lv_item1_processed = abap_true.
+               ENDIF.
+
+             " CASO B: Outros Itens (002, 003...) - Só adiciona SE tiver projeto
+             ELSE.
+               IF ls_proj-ProjectID IS NOT INITIAL.
+
+                 " Cria uma cópia da linha Mestre (para herdar Cliente, Data, NF, etc)
+                 DATA(ls_child) = ls_row.
+
+                 " Atualiza dados específicos do Item Filho
+                 ls_child-ItemNumber     = ls_proj-AccountingDocumentItem.
+                 ls_child-IdProjeto      = ls_proj-ProjectID.
+                 ls_child-IdtProjeto     = ls_proj-WBSDescription.
+                 ls_child-ProjetoFinal   = ls_proj-ProjectID.
+                 ls_child-IdProjetoFinal = ls_proj-WBSDescription.
+
+                 " Valor: Inverte sinal ou usa débito funcional conforme necessidade
+                 ls_child-VlrProjFinal   = ls_proj-TotalCreditAmount * -1.
+
+                 " Opcional: Zerar valor de pagamento na linha filha para não somar 2x no totalizador?
+                 " ls_child-ValorPagtoLiq = 0.
+
+                 APPEND ls_child TO lt_writer_final.
+
+                 " Nota: Filtro de Projeto (lr_project) poderia ser aplicado aqui para childs,
+                 " mas como o filtro é global, aplicamos no final ou deixamos passar.
+               ENDIF.
+             ENDIF.
+
+          ENDLOOP.
+
+          " CASO C: O Item 001 não tinha projeto (não entrou no IF acima)
+          " Precisamos adicionar a linha "Pura" mesmo assim.
+          IF lv_item1_processed = abap_false.
+             APPEND ls_row TO lt_writer_final.
+          ENDIF.
 
         ENDLOOP.
 
@@ -540,6 +610,79 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
         APPEND LINES OF lt_writer_final TO lt_full_data.
 
       ENDIF.
+
+
+       " =====================================================================
+     " [NOVO] LÓGICA DE RECLASSIFICAÇÃO PARCIAL DIRETO NA JOURNAL ENTRY
+     " =====================================================================
+       DATA lt_final_filtered TYPE STANDARD TABLE OF zi_billing_min_q.
+
+       " 1. Limpa duplicatas geradas pelo JOIN antes de processar a reclassificação
+       SORT lt_full_data BY DocNumberOut ItemNumber ProjetoFinal.
+       DELETE ADJACENT DUPLICATES FROM lt_full_data COMPARING DocNumberOut ItemNumber ProjetoFinal.
+
+       LOOP AT lt_full_data ASSIGNING FIELD-SYMBOL(<ls_fat_row>).
+          DATA(lv_processed) = abap_false. " Flag de controle
+
+          IF <ls_fat_row>-DocReclass IS NOT INITIAL AND <ls_fat_row>-DocReclass <> '0000000000' AND <ls_fat_row>-DocReclass <> '0'.
+
+                     " Calcula a diferença entre o Valor do Item e o Reclassificado
+                     DATA lv_remainder LIKE <ls_fat_row>-ItemGrossValue.
+                     lv_remainder = <ls_fat_row>-ItemGrossValue - <ls_fat_row>-VlrProjFinal.
+
+                     " Se o valor reclassificado for menor que o total do item, cria a linha complementar
+                     IF lv_remainder > 0.
+                         lv_processed = abap_true. " Marca que passou pela reclassificação dupla
+
+                         " 1. Ajusta o Valor Bruto do Item na linha original para exibir só a parte reclassificada
+                         <ls_fat_row>-ItemGrossValue = <ls_fat_row>-VlrProjFinal.
+
+*================================="01/06/2026 -  Marcelo Souza - Ajuste jira ========================================
+                         "Acerta valor bruto item de acordo com a reclassificação -valor total da nota
+                         <ls_fat_row>-ItemGrossValue = <ls_fat_row>-VlrBruto.
+
+                         APPEND <ls_fat_row> TO lt_final_filtered.
+
+                         " 2. Cria a linha Complementar (Restante)
+                         DATA(ls_remainder) = <ls_fat_row>.
+
+                         " Valores do Restante
+                         ls_remainder-VlrProjFinal   = lv_remainder.
+                         ls_remainder-ItemGrossValue = lv_remainder.
+
+                         " Zera totalizadores para não duplicar as somas no final do relatório
+                         ls_remainder-ValorPagtoLiq  = 0.
+
+                         " Volta o projeto para o Original
+                         ls_remainder-ProjetoFinal   = ls_remainder-IdProjeto.
+                         ls_remainder-IdProjetoFinal = ls_remainder-IdtProjeto.
+                         ls_remainder-ItemNumber     = ls_remainder-ItemNumber + 10.
+
+                         " Filtro na linha complementar
+                         IF lr_project IS NOT INITIAL AND ls_remainder-IdProjeto NOT IN lr_project. CONTINUE. ENDIF.
+
+                         "Acerta valor bruto item de acordo com a reclassificação
+                         ls_remainder-ItemGrossValue = ls_remainder-VlrBruto.
+
+                         APPEND ls_remainder TO lt_final_filtered.
+
+                         " Pula para o próximo registro
+                         CONTINUE.
+                     ENDIF.
+          ENDIF.
+
+          " === SOLUÇÃO DO BUG: Mantém o resto do relatório vivo ===
+          " Se a linha não passou pelo particionamento (não teve sobra), adiciona ela normalmente
+          IF lv_processed = abap_false.
+              APPEND <ls_fat_row> TO lt_final_filtered.
+          ENDIF.
+
+       ENDLOOP.
+
+       lt_full_data = lt_final_filtered.
+      " =====================================================================
+      " =====================================================================
+
 
       " =====================================================================
       " === PAGINAÇÃO E RETORNO FINAL ===
@@ -561,9 +704,11 @@ CLASS zcl_rap_billing_min_q IMPLEMENTATION.
           ENDLOOP.
       ENDIF.
 
+
+
       io_response->set_data( lt_page ).
 
-      IF l_wants_count <> abap_true.
+      IF l_wants_count = abap_true.
         " Nota: Se você já calculou o count no bloco 1, precisa somar com este aqui
          "io_response->set_total_number_of_records( lines( lt_page ) + lv_total_fat ).
          io_response->set_total_number_of_records( lv_total_lines ).
